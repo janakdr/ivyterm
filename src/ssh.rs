@@ -1,21 +1,182 @@
 use std::{
-    fs::File,
-    io::BufReader,
-    net::{SocketAddr, ToSocketAddrs},
-    path::Path,
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, ToSocketAddrs},
+    process::{Command, Stdio},
+    thread,
     time::Duration,
 };
 
-use dirs::home_dir;
 use log::debug;
 use mio::{net::TcpStream, Events, Interest, Poll, Token};
 use ssh2::{DisconnectCode, MethodType, Session};
-use ssh2_config::{HostParams, ParseRule, SshConfig};
 
 pub struct SSHData(pub String, pub Session, pub Poll, pub Events);
 
 pub const SSH_TOKEN: Token = Token(0);
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Default)]
+pub struct SystemSshConfig {
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub proxy_command: Option<String>,
+    // Fields for ssh2 configuration
+    pub compression: Option<bool>,
+    pub tcp_keep_alive: Option<bool>,
+    pub server_alive_interval: Option<Duration>,
+    pub kex_algorithms: Option<Vec<String>>,
+    pub host_key_algorithms: Option<Vec<String>>,
+    pub ciphers: Option<Vec<String>>,
+    pub mac: Option<Vec<String>>,
+}
+
+pub fn query_system_ssh_config(host: &str) -> io::Result<SystemSshConfig> {
+    let output = Command::new("ssh")
+        .arg("-G")
+        .arg(host)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("ssh -G failed: {}", String::from_utf8_lossy(&output.stderr)),
+        ));
+    }
+
+    let mut config = SystemSshConfig::default();
+    let reader = BufReader::new(io::Cursor::new(output.stdout));
+
+    for line in reader.lines() {
+        let line = line?;
+        let parts: Vec<&str> = line.splitn(2, ' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let key = parts[0].to_lowercase();
+        let value = parts[1].trim();
+
+        match key.as_str() {
+            "hostname" => config.hostname = Some(value.to_string()),
+            "port" => config.port = value.parse().ok(),
+            "user" => config.user = Some(value.to_string()),
+            "proxycommand" => {
+                if value != "none" {
+                    config.proxy_command = Some(value.to_string())
+                }
+            }
+            "compression" => config.compression = Some(value == "yes"),
+            "tcpkeepalive" => config.tcp_keep_alive = Some(value == "yes"),
+            "serveraliveinterval" => {
+                if let Ok(secs) = value.parse::<u64>() {
+                    if secs > 0 {
+                        config.server_alive_interval = Some(Duration::from_secs(secs));
+                    }
+                }
+            }
+             "kexalgorithms" => {
+                 config.kex_algorithms = Some(value.split(',').map(|s| s.to_string()).collect())
+             }
+             "hostkeyalgorithms" => {
+                 config.host_key_algorithms = Some(value.split(',').map(|s| s.to_string()).collect())
+             }
+             "ciphers" => {
+                 config.ciphers = Some(value.split(',').map(|s| s.to_string()).collect())
+             }
+             "macs" => {
+                 config.mac = Some(value.split(',').map(|s| s.to_string()).collect())
+             }
+            _ => {}
+        }
+    }
+
+    Ok(config)
+}
+
+pub fn spawn_proxy_bridge(command: &str) -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    debug!("Proxy bridge listening on {}", addr);
+
+    let command = command.to_string();
+
+    thread::spawn(move || {
+        // Accept one connection
+        let (mut stream, _) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Proxy bridge failed to accept connection: {}", e);
+                return;
+            }
+        };
+
+        // Spawn the proxy command
+        let mut child = match Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit()) // Let stderr go to console for debug
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to spawn proxy command '{}': {}", command, e);
+                return;
+            }
+        };
+
+        let mut child_stdin = child.stdin.take().unwrap();
+        let mut child_stdout = child.stdout.take().unwrap();
+        let mut stream_clone = stream.try_clone().unwrap();
+
+        // Bridge: Stream -> Child Stdin
+        thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        if let Err(e) = child_stdin.write_all(&buffer[..n]) {
+                             debug!("Bridge write to child stdin failed: {}", e);
+                             break;
+                        }
+                        let _ = child_stdin.flush();
+                    }
+                    Err(e) => {
+                        debug!("Bridge read from stream failed: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Bridge: Child Stdout -> Stream
+        let mut buffer = [0; 4096];
+        loop {
+             match child_stdout.read(&mut buffer) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if let Err(e) = stream_clone.write_all(&buffer[..n]) {
+                        debug!("Bridge write to stream failed: {}", e);
+                        break;
+                    }
+                    let _ = stream_clone.flush();
+                }
+                Err(e) => {
+                     debug!("Bridge read from child stdout failed: {}", e);
+                     break;
+                }
+             }
+        }
+
+        // When child stdout closes, we kill the child if it's still running?
+        // Actually, if SSH disconnects, the pipes close.
+        let _ = child.wait();
+    });
+
+    Ok(addr)
+}
 
 #[inline]
 fn check_connected(tcp: &mut TcpStream) -> Result<(), ()> {
@@ -119,46 +280,72 @@ fn connect_tcp(host: &str) -> Option<(TcpStream, Poll, Events)> {
 
 pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
     let original_host = host.to_string();
-    let config = read_config();
-    let params = config.query(host);
-
-    // Parse SSH host
-    let (username, host) = if host.contains("@") {
-        let split: Vec<&str> = host.split("@").collect();
-        if split.len() != 2 {
-            eprintln!("Bad SSH 'username@host': {}", host);
+    let params = match query_system_ssh_config(host) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to query system ssh config: {}", e);
             return Err(());
         }
-        (Some(split[0]), split[1])
-    } else {
-        (None, host)
     };
-    let host = params.host_name.as_deref().unwrap_or(host);
+
+    // Parse SSH host (resolved from ssh -G)
+    // ssh -G returns the final hostname and port.
+    // If the original host string had user@, ssh -G handles it.
+    // But wait, if I pass `user@host` to `ssh -G`, it returns `user` and `hostname`.
+
+    let host_addr = params.hostname.as_deref().unwrap_or(host);
     let port = params.port.unwrap_or(22);
-    let host = match host.contains(':') {
-        true => host.to_string(),
-        false => format!("{}:{}", host, port),
-    };
+    let full_host_addr = format!("{}:{}", host_addr, port);
 
     // Parse username
     let username = match params.user.as_ref() {
         Some(u) => u.clone(),
         None => {
-            if let Some(username) = username {
-                username.to_string()
-            } else {
+             // Fallback if ssh -G didn't give user (unlikely)
+             if host.contains("@") {
+                 host.split("@").next().unwrap().to_string()
+             } else {
                 eprintln!("No username provided for SSH");
                 return Err(());
-            }
+             }
         }
     };
-    debug!("SSH username: {}, host: {}", username, host);
+    debug!("SSH username: {}, host: {}", username, full_host_addr);
 
     // Connect to host
-    let (tcp, poll, events) = match connect_tcp(&host) {
-        Some(ret) => ret,
+    let (tcp, poll, events) = match params.proxy_command.as_ref() {
+        Some(cmd_template) => {
+             // Expand %h and %p
+             let expanded_cmd = cmd_template
+                 .replace("%h", host_addr)
+                 .replace("%p", &port.to_string());
+             debug!("Using ProxyCommand: {}", expanded_cmd);
+
+             let bridge_addr = match spawn_proxy_bridge(&expanded_cmd) {
+                 Ok(addr) => addr,
+                 Err(e) => {
+                     eprintln!("Failed to spawn proxy bridge: {}", e);
+                     return Err(());
+                 }
+             };
+             // Connect to the bridge
+             // We use 127.0.0.1:port
+             // connect_tcp expects a string "host:port".
+             match connect_tcp(&bridge_addr.to_string()) {
+                Some(ret) => ret,
+                None => {
+                    eprintln!("Failed to connect to proxy bridge");
+                    return Err(());
+                }
+             }
+        },
         None => {
-            return Err(());
+             match connect_tcp(&full_host_addr) {
+                Some(ret) => ret,
+                None => {
+                    return Err(());
+                }
+            }
         }
     };
 
@@ -205,25 +392,11 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
         };
     }
 
-    println!("Established connection with {}", host);
+    println!("Established connection with {}", full_host_addr);
     return Ok(SSHData(original_host, session, poll, events));
 }
 
-fn read_config() -> SshConfig {
-    let mut config_path = home_dir().expect("Failed to get home_dir for guest OS");
-    config_path.extend(Path::new(".ssh/config"));
-
-    let mut reader = match File::open(config_path.as_path()) {
-        Ok(f) => BufReader::new(f),
-        Err(err) => panic!("Could not open file '{}': {}", config_path.display(), err),
-    };
-    match SshConfig::default().parse(&mut reader, ParseRule::STRICT) {
-        Ok(config) => config,
-        Err(err) => panic!("Failed to parse configuration: {}", err),
-    }
-}
-
-fn configure_session(session: &mut Session, params: &HostParams) {
+fn configure_session(session: &mut Session, params: &SystemSshConfig) {
     if let Some(compress) = params.compression {
         debug!("compression: {}", compress);
         session.set_compress(compress);

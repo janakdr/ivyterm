@@ -481,12 +481,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glob"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8d1add55171497b4705a648c6b583acafb01d58050a51727785f0b2c8e0a2b2"
-
-[[package]]
 name = "gobject-sys"
 version = "0.20.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -654,7 +648,6 @@ dependencies = [
  "mio",
  "serde",
  "ssh2",
- "ssh2-config",
  "thiserror",
  "toml",
  "vmap",
@@ -1077,20 +1070,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ssh2-config"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b54c1f8a904a031c129e6e258994999839d6f0ffad4964062cb76d975259a0d8"
-dependencies = [
- "bitflags",
- "dirs",
- "glob",
- "log",
- "thiserror",
- "wildmatch",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1259,12 +1238,6 @@ name = "wasi"
 version = "0.11.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
-
-[[package]]
-name = "wildmatch"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ce1ab1f8c62655ebe1350f589c61e505cf94d385bc6a12899442d9081e71fd"
 
 [[package]]
 name = "winapi"
