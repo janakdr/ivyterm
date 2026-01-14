@@ -1,8 +1,7 @@
 use std::{
-    io::{self, BufRead, BufReader, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, ToSocketAddrs},
-    process::{Command, Stdio},
-    thread,
+    io::{self, BufRead, BufReader},
+    net::{SocketAddr, ToSocketAddrs},
+    process::Command,
     time::Duration,
 };
 
@@ -10,7 +9,10 @@ use log::debug;
 use mio::{net::TcpStream, Events, Interest, Poll, Token};
 use ssh2::{DisconnectCode, Session};
 
-pub struct SSHData(pub String, pub Session, pub Poll, pub Events);
+pub enum SSHData {
+    Native(String, Session, Poll, Events),
+    Binary(String),
+}
 
 pub const SSH_TOKEN: Token = Token(0);
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -93,94 +95,6 @@ pub fn query_system_ssh_config(host: &str) -> io::Result<SystemSshConfig> {
     Ok(config)
 }
 
-pub fn spawn_proxy_bridge(command: &str) -> io::Result<SocketAddr> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let addr = listener.local_addr()?;
-    debug!("Proxy bridge listening on {}", addr);
-
-    let command = command.to_string();
-
-    thread::spawn(move || {
-        // Accept one connection
-        let (mut stream, _) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Proxy bridge failed to accept connection: {}", e);
-                return;
-            }
-        };
-
-        // Spawn the proxy command
-        let mut child = match Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit()) // Let stderr go to console for debug
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("Failed to spawn proxy command '{}': {}", command, e);
-                return;
-            }
-        };
-
-        let mut child_stdin = child.stdin.take().unwrap();
-        let mut child_stdout = child.stdout.take().unwrap();
-        let mut stream_clone = stream.try_clone().unwrap();
-
-        // Bridge: Stream -> Child Stdin
-        thread::spawn(move || {
-            let mut buffer = [0; 4096];
-            loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(n) => {
-                        if let Err(e) = child_stdin.write_all(&buffer[..n]) {
-                             debug!("Bridge write to child stdin failed: {}", e);
-                             break;
-                        }
-                        let _ = child_stdin.flush();
-                    }
-                    Err(e) => {
-                        debug!("Bridge read from stream failed: {}", e);
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Bridge: Child Stdout -> Stream
-        let mut buffer = [0; 4096];
-        loop {
-             match child_stdout.read(&mut buffer) {
-                Ok(0) => {
-                    // EOF from child stdout, shutdown stream write
-                    let _ = stream_clone.shutdown(Shutdown::Write);
-                    break;
-                },
-                Ok(n) => {
-                    if let Err(e) = stream_clone.write_all(&buffer[..n]) {
-                        debug!("Bridge write to stream failed: {}", e);
-                        break;
-                    }
-                    let _ = stream_clone.flush();
-                }
-                Err(e) => {
-                     debug!("Bridge read from child stdout failed: {}", e);
-                     break;
-                }
-             }
-        }
-
-        // When child stdout closes, we kill the child if it's still running?
-        // Actually, if SSH disconnects, the pipes close.
-        let _ = child.wait();
-    });
-
-    Ok(addr)
-}
 
 #[inline]
 fn check_connected(tcp: &mut TcpStream) -> Result<(), ()> {
@@ -316,40 +230,19 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
     };
     debug!("SSH username: {}, host: {}", username, full_host_addr);
 
-    // Connect to host
-    let (tcp, poll, events) = match params.proxy_command.as_ref() {
-        Some(cmd_template) => {
-             // Expand %h and %p
-             let expanded_cmd = cmd_template
-                 .replace("%h", host_addr)
-                 .replace("%p", &port.to_string());
-             eprintln!("Using ProxyCommand: {}", expanded_cmd);
+    if params.proxy_command.is_some() {
+        // If ProxyCommand is present, we use the binary SSH client directly
+        // because libssh2 often lacks support for modern crypto algorithms
+        // required by servers that use ProxyCommand.
+        eprintln!("ProxyCommand detected, using system ssh binary for {}", full_host_addr);
+        return Ok(SSHData::Binary(full_host_addr));
+    }
 
-             let bridge_addr = match spawn_proxy_bridge(&expanded_cmd) {
-                 Ok(addr) => addr,
-                 Err(e) => {
-                     eprintln!("Failed to spawn proxy bridge: {}", e);
-                     return Err(());
-                 }
-             };
-             // Connect to the bridge
-             // We use 127.0.0.1:port
-             // connect_tcp expects a string "host:port".
-             match connect_tcp(&bridge_addr.to_string()) {
-                Some(ret) => ret,
-                None => {
-                    eprintln!("Failed to connect to proxy bridge");
-                    return Err(());
-                }
-             }
-        },
+    // Connect to host
+    let (tcp, poll, events) = match connect_tcp(&full_host_addr) {
+        Some(ret) => ret,
         None => {
-             match connect_tcp(&full_host_addr) {
-                Some(ret) => ret,
-                None => {
-                    return Err(());
-                }
-            }
+            return Err(());
         }
     };
 
@@ -367,7 +260,7 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
     // Authenticate
     let code = match session.userauth_agent(&username) {
         Ok(_) => {
-            return Ok(SSHData(original_host, session, poll, events));
+            return Ok(SSHData::Native(original_host, session, poll, events));
         }
         Err(err) => err.code(),
     };
@@ -402,7 +295,7 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
     }
 
     println!("Established connection with {}", full_host_addr);
-    return Ok(SSHData(original_host, session, poll, events));
+    return Ok(SSHData::Native(original_host, session, poll, events));
 }
 
 fn configure_session(session: &mut Session, params: &SystemSshConfig) {
