@@ -1,6 +1,6 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, ToSocketAddrs},
+    net::{Shutdown, SocketAddr, TcpListener, ToSocketAddrs},
     process::{Command, Stdio},
     thread,
     time::Duration,
@@ -155,7 +155,11 @@ pub fn spawn_proxy_bridge(command: &str) -> io::Result<SocketAddr> {
         let mut buffer = [0; 4096];
         loop {
              match child_stdout.read(&mut buffer) {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    // EOF from child stdout, shutdown stream write
+                    let _ = stream_clone.shutdown(Shutdown::Write);
+                    break;
+                },
                 Ok(n) => {
                     if let Err(e) = stream_clone.write_all(&buffer[..n]) {
                         debug!("Bridge write to stream failed: {}", e);
@@ -319,7 +323,7 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
              let expanded_cmd = cmd_template
                  .replace("%h", host_addr)
                  .replace("%p", &port.to_string());
-             debug!("Using ProxyCommand: {}", expanded_cmd);
+             eprintln!("Using ProxyCommand: {}", expanded_cmd);
 
              let bridge_addr = match spawn_proxy_bridge(&expanded_cmd) {
                  Ok(addr) => addr,
@@ -350,10 +354,15 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
     };
 
     // Create SSH session
-    let mut session = Session::new().unwrap();
+    let mut session = Session::new().map_err(|e| {
+        eprintln!("Failed to create SSH session: {}", e);
+    })?;
     configure_session(&mut session, &params);
     session.set_tcp_stream(tcp);
-    session.handshake().unwrap();
+    if let Err(e) = session.handshake() {
+        eprintln!("SSH handshake failed: {}", e);
+        return Err(());
+    }
 
     // Authenticate
     let code = match session.userauth_agent(&username) {
