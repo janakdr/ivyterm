@@ -234,8 +234,8 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
         // If ProxyCommand is present, we use the binary SSH client directly
         // because libssh2 often lacks support for modern crypto algorithms
         // required by servers that use ProxyCommand.
-        eprintln!("ProxyCommand detected, using system ssh binary for {}", full_host_addr);
-        return Ok(SSHData::Binary(full_host_addr));
+        eprintln!("ProxyCommand detected, using system ssh binary for {}", original_host);
+        return Ok(SSHData::Binary(original_host));
     }
 
     // Connect to host
