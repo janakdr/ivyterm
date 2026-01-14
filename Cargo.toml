@@ -49,3 +49,7 @@ mode = "0644"
 source = "data/com.tomiyou.ivyTerm.svg"
 dest = "/usr/share/icons/hicolor/scalable/apps/com.tomiyou.ivyTerm.svg"
 mode = "0644"
+
+[[bin]]
+name = "ivyterm"
+path = "src/main.rs"

@@ -43,7 +43,7 @@ glib::wrapper! {
 }
 
 impl IvyTmuxWindow {
-    pub fn new(app: &IvyApplication, tmux_session: &str, ssh_host: Option<(&str, &str)>) -> Self {
+    pub fn new(app: &IvyApplication, tmux_session: &str, ssh_host: Option<(&str, &str, bool)>) -> Self {
         let window: Self = Object::builder().build();
         window.set_application(Some(app));
         window.set_title(Some(APPLICATION_TITLE));
@@ -161,8 +161,8 @@ impl IvyTmuxWindow {
         window_box.append(&tab_view);
         window.set_content(Some(&window_box));
 
-        if let Some((ssh_target, ssh_password)) = ssh_host {
-            new_ssh_session(&window, tmux_session, ssh_target, ssh_password);
+        if let Some((ssh_target, ssh_password, use_binary)) = ssh_host {
+            new_ssh_session(&window, tmux_session, ssh_target, ssh_password, use_binary);
         } else {
             window.initialize_tmux(tmux_session, None);
         }
@@ -311,6 +311,7 @@ fn new_ssh_session(
     tmux_session: &str,
     ssh_target: &str,
     ssh_password: &str,
+    use_binary: bool,
 ) {
     let tmux_session = tmux_session.to_string();
     let ssh_target = ssh_target.to_string();
@@ -320,14 +321,17 @@ fn new_ssh_session(
         #[weak]
         window,
         async move {
-            let ret =
-                match gio::spawn_blocking(move || new_session(&ssh_target, &ssh_password)).await {
-                    Ok(ret) => ret,
-                    Err(_) => {
-                        window.close();
-                        return;
-                    }
-                };
+            let ret = match gio::spawn_blocking(move || {
+                new_session(&ssh_target, &ssh_password, use_binary)
+            })
+            .await
+            {
+                Ok(ret) => ret,
+                Err(_) => {
+                    window.close();
+                    return;
+                }
+            };
 
             let tuple = match ret {
                 Ok(ret) => ret,

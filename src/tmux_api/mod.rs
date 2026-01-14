@@ -163,8 +163,19 @@ impl TmuxAPI {
         cmd_queue_sender.send_blocking(TmuxCommand::Init).unwrap();
 
         // Spawn TMUX subprocess
-        let spawn = if let Some(tuple) = ssh_session {
-            new_with_ssh(session_name, tuple, tmux_event_sender, cmd_queue_receiver)
+        let spawn = if let Some(ssh_data) = ssh_session {
+            match ssh_data {
+                SSHData::Native(..) => {
+                    new_with_ssh(session_name, ssh_data, tmux_event_sender, cmd_queue_receiver)
+                }
+                SSHData::Binary(host) => new_with_ssh_binary(
+                    &host,
+                    session_name,
+                    tmux_event_sender,
+                    cmd_queue_receiver,
+                )
+                .map(|ok| (ok, None)),
+            }
         } else {
             new_without_ssh(session_name, tmux_event_sender, cmd_queue_receiver)
                 .map(|ok| (ok, None))
@@ -222,7 +233,10 @@ fn new_with_ssh(
     tmux_event_sender: Sender<TmuxEvent>,
     cmd_queue_receiver: Receiver<TmuxCommand>,
 ) -> Result<(Box<dyn Write>, Option<Session>), IvyError> {
-    let SSHData(ssh_target, session, mut poll, mut events) = ssh_data;
+    let (ssh_target, session, mut poll, mut events) = match ssh_data {
+        SSHData::Native(t, s, p, e) => (t, s, p, e),
+        _ => unreachable!(),
+    };
 
     let command = format!("tmux -2 -C new-session -A -s {}", tmux_name);
     let mut channel = session.channel_session().unwrap();
@@ -342,6 +356,62 @@ fn new_without_ssh(
     let mut stdout_stream = process.stdout.take().expect("Failed to open stdout");
     spawn_blocking(move || {
         let mut ring_buffer = Ring::new(16_000).unwrap();
+        let mut state = TmuxParserState::new(tmux_event_sender, cmd_queue_receiver, None);
+
+        loop {
+            match read_into_ringbuffer(&mut stdout_stream, &mut ring_buffer) {
+                Ok(bytes_read) => {
+                    if bytes_read < 1 {
+                        continue;
+                    }
+
+                    // Consume the read bytes
+                    if let Err(_) = tmux_parse_data(&mut state, &mut ring_buffer) {
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let stdin_stream = process.stdin.take().expect("Failed to open stdin");
+    return Ok(Box::new(stdin_stream));
+}
+
+fn new_with_ssh_binary(
+    host: &str,
+    session_name: &str,
+    tmux_event_sender: Sender<TmuxEvent>,
+    cmd_queue_receiver: Receiver<TmuxCommand>,
+) -> Result<Box<dyn Write>, IvyError> {
+    println!("Connecting via ssh binary to {} for session {}", host, session_name);
+    // Command: ssh <host> tmux -2 -C new-session -A -s <session_name>
+    let mut process = Command::new("ssh")
+        .arg(host)
+        .arg("tmux")
+        .arg("-2")
+        .arg("-C")
+        .arg("new-session")
+        .arg("-A")
+        .arg("-s")
+        .arg(session_name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit()) // Let ssh/tmux stderr go to console
+        .spawn()
+        .map_err(|e| {
+            eprintln!("Failed to spawn ssh command: {}", e);
+            IvyError::TmuxSpawnFailed
+        })?;
+
+    // Read from SSH STDOUT and send events to the channel on a separate thread
+    let mut stdout_stream = process.stdout.take().expect("Failed to open stdout");
+    spawn_blocking(move || {
+        let mut ring_buffer = Ring::new(16_000).unwrap();
+        // For binary ssh, ssh_target isn't used in parser state logic heavily,
+        // but we can pass Some(host) if needed.
+        // new_without_ssh passes None.
         let mut state = TmuxParserState::new(tmux_event_sender, cmd_queue_receiver, None);
 
         loop {
