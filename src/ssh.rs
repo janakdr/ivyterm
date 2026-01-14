@@ -1,13 +1,16 @@
 use std::{
-    io::{self, BufRead, BufReader},
+    io::BufReader,
     net::{SocketAddr, ToSocketAddrs},
-    process::Command,
     time::Duration,
 };
 
+use dirs::home_dir;
 use log::debug;
 use mio::{net::TcpStream, Events, Interest, Poll, Token};
 use ssh2::{DisconnectCode, Session};
+use ssh2_config::{HostParams, ParseRule, SshConfig};
+use std::fs::File;
+use std::path::Path;
 
 pub enum SSHData {
     Native(String, Session, Poll, Events),
@@ -16,85 +19,6 @@ pub enum SSHData {
 
 pub const SSH_TOKEN: Token = Token(0);
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Default)]
-pub struct SystemSshConfig {
-    pub hostname: Option<String>,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-    pub proxy_command: Option<String>,
-    // Fields for ssh2 configuration
-    pub compression: Option<bool>,
-    pub tcp_keep_alive: Option<bool>,
-    pub server_alive_interval: Option<Duration>,
-    pub kex_algorithms: Option<Vec<String>>,
-    pub host_key_algorithms: Option<Vec<String>>,
-    pub ciphers: Option<Vec<String>>,
-    pub mac: Option<Vec<String>>,
-}
-
-pub fn query_system_ssh_config(host: &str) -> io::Result<SystemSshConfig> {
-    let output = Command::new("ssh")
-        .arg("-G")
-        .arg(host)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("ssh -G failed: {}", String::from_utf8_lossy(&output.stderr)),
-        ));
-    }
-
-    let mut config = SystemSshConfig::default();
-    let reader = BufReader::new(io::Cursor::new(output.stdout));
-
-    for line in reader.lines() {
-        let line = line?;
-        let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let key = parts[0].to_lowercase();
-        let value = parts[1].trim();
-
-        match key.as_str() {
-            "hostname" => config.hostname = Some(value.to_string()),
-            "port" => config.port = value.parse().ok(),
-            "user" => config.user = Some(value.to_string()),
-            "proxycommand" => {
-                if value != "none" {
-                    config.proxy_command = Some(value.to_string())
-                }
-            }
-            "compression" => config.compression = Some(value == "yes"),
-            "tcpkeepalive" => config.tcp_keep_alive = Some(value == "yes"),
-            "serveraliveinterval" => {
-                if let Ok(secs) = value.parse::<u64>() {
-                    if secs > 0 {
-                        config.server_alive_interval = Some(Duration::from_secs(secs));
-                    }
-                }
-            }
-             "kexalgorithms" => {
-                 config.kex_algorithms = Some(value.split(',').map(|s| s.to_string()).collect())
-             }
-             "hostkeyalgorithms" => {
-                 config.host_key_algorithms = Some(value.split(',').map(|s| s.to_string()).collect())
-             }
-             "ciphers" => {
-                 config.ciphers = Some(value.split(',').map(|s| s.to_string()).collect())
-             }
-             "macs" => {
-                 config.mac = Some(value.split(',').map(|s| s.to_string()).collect())
-             }
-            _ => {}
-        }
-    }
-
-    Ok(config)
-}
-
 
 #[inline]
 fn check_connected(tcp: &mut TcpStream) -> Result<(), ()> {
@@ -196,50 +120,54 @@ fn connect_tcp(host: &str) -> Option<(TcpStream, Poll, Events)> {
     return None;
 }
 
-pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
+pub fn new_session(host: &str, password: &str, use_binary: bool) -> Result<SSHData, ()> {
     let original_host = host.to_string();
-    let params = match query_system_ssh_config(host) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to query system ssh config: {}", e);
+
+    if use_binary {
+        // If user requested system SSH binary, we use it directly.
+        // This supports ProxyCommand, modern crypto, etc.
+        debug!("Using system ssh binary for {}", original_host);
+        return Ok(SSHData::Binary(original_host));
+    }
+
+    // Legacy libssh2 path
+    let config = read_config();
+    let params = config.query(host);
+
+    // Parse SSH host
+    let (username, host) = if host.contains("@") {
+        let split: Vec<&str> = host.split("@").collect();
+        if split.len() != 2 {
+            eprintln!("Bad SSH 'username@host': {}", host);
             return Err(());
         }
+        (Some(split[0]), split[1])
+    } else {
+        (None, host)
     };
-
-    // Parse SSH host (resolved from ssh -G)
-    // ssh -G returns the final hostname and port.
-    // If the original host string had user@, ssh -G handles it.
-    // But wait, if I pass `user@host` to `ssh -G`, it returns `user` and `hostname`.
-
-    let host_addr = params.hostname.as_deref().unwrap_or(host);
+    let host = params.host_name.as_deref().unwrap_or(host);
     let port = params.port.unwrap_or(22);
-    let full_host_addr = format!("{}:{}", host_addr, port);
+    let host = match host.contains(':') {
+        true => host.to_string(),
+        false => format!("{}:{}", host, port),
+    };
 
     // Parse username
     let username = match params.user.as_ref() {
         Some(u) => u.clone(),
         None => {
-             // Fallback if ssh -G didn't give user (unlikely)
-             if host.contains("@") {
-                 host.split("@").next().unwrap().to_string()
-             } else {
+            if let Some(username) = username {
+                username.to_string()
+            } else {
                 eprintln!("No username provided for SSH");
                 return Err(());
-             }
+            }
         }
     };
-    debug!("SSH username: {}, host: {}", username, full_host_addr);
-
-    if params.proxy_command.is_some() {
-        // If ProxyCommand is present, we use the binary SSH client directly
-        // because libssh2 often lacks support for modern crypto algorithms
-        // required by servers that use ProxyCommand.
-        eprintln!("ProxyCommand detected, using system ssh binary for {}", original_host);
-        return Ok(SSHData::Binary(original_host));
-    }
+    debug!("SSH username: {}, host: {}", username, host);
 
     // Connect to host
-    let (tcp, poll, events) = match connect_tcp(&full_host_addr) {
+    let (tcp, poll, events) = match connect_tcp(&host) {
         Some(ret) => ret,
         None => {
             return Err(());
@@ -247,15 +175,10 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
     };
 
     // Create SSH session
-    let mut session = Session::new().map_err(|e| {
-        eprintln!("Failed to create SSH session: {}", e);
-    })?;
+    let mut session = Session::new().unwrap();
     configure_session(&mut session, &params);
     session.set_tcp_stream(tcp);
-    if let Err(e) = session.handshake() {
-        eprintln!("SSH handshake failed: {}", e);
-        return Err(());
-    }
+    session.handshake().unwrap();
 
     // Authenticate
     let code = match session.userauth_agent(&username) {
@@ -294,11 +217,25 @@ pub fn new_session(host: &str, password: &str) -> Result<SSHData, ()> {
         };
     }
 
-    println!("Established connection with {}", full_host_addr);
+    println!("Established connection with {}", host);
     return Ok(SSHData::Native(original_host, session, poll, events));
 }
 
-fn configure_session(session: &mut Session, params: &SystemSshConfig) {
+fn read_config() -> SshConfig {
+    let mut config_path = home_dir().expect("Failed to get home_dir for guest OS");
+    config_path.extend(Path::new(".ssh/config"));
+
+    let mut reader = match File::open(config_path.as_path()) {
+        Ok(f) => BufReader::new(f),
+        Err(err) => panic!("Could not open file '{}': {}", config_path.display(), err),
+    };
+    match SshConfig::default().parse(&mut reader, ParseRule::STRICT) {
+        Ok(config) => config,
+        Err(err) => panic!("Failed to parse configuration: {}", err),
+    }
+}
+
+fn configure_session(session: &mut Session, params: &HostParams) {
     if let Some(compress) = params.compression {
         debug!("compression: {}", compress);
         session.set_compress(compress);
