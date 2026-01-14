@@ -8,7 +8,7 @@ use std::{
 
 use log::debug;
 use mio::{net::TcpStream, Events, Interest, Poll, Token};
-use ssh2::{DisconnectCode, MethodType, Session};
+use ssh2::{DisconnectCode, Session};
 
 pub struct SSHData(pub String, pub Session, pub Poll, pub Events);
 
@@ -415,31 +415,41 @@ fn configure_session(session: &mut Session, params: &SystemSshConfig) {
         debug!("keepalive interval: {} seconds", interval);
         session.set_keepalive(true, interval);
     }
-    // algos
+    // crypto algos
+    // We intentionally do NOT apply crypto preferences (kex, ciphers, macs) from ssh -G.
+    // ssh -G returns the configuration of the system `ssh` client (OpenSSH), which often
+    // includes modern algorithms that `libssh2` does not support.
+    // Enforcing these preferences can cause `libssh2` to fail handshake if it cannot
+    // match the preferred algorithms with the server, or if the intersection is empty/invalid.
+    // We let `libssh2` use its default supported algorithms, which gives the best chance
+    // of connecting.
+
+    /*
     if let Some(algos) = params.kex_algorithms.as_deref() {
         if let Err(err) = session.method_pref(MethodType::Kex, algos.join(",").as_str()) {
-            panic!("Could not set KEX algorithms: {}", err);
+            debug!("Could not set KEX algorithms: {}", err);
         }
     }
     if let Some(algos) = params.host_key_algorithms.as_deref() {
         if let Err(err) = session.method_pref(MethodType::HostKey, algos.join(",").as_str()) {
-            panic!("Could not set host key algorithms: {}", err);
+            debug!("Could not set host key algorithms: {}", err);
         }
     }
     if let Some(algos) = params.ciphers.as_deref() {
         if let Err(err) = session.method_pref(MethodType::CryptCs, algos.join(",").as_str()) {
-            panic!("Could not set crypt algorithms (client-server): {}", err);
+            debug!("Could not set crypt algorithms (client-server): {}", err);
         }
         if let Err(err) = session.method_pref(MethodType::CryptSc, algos.join(",").as_str()) {
-            panic!("Could not set crypt algorithms (server-client): {}", err);
+            debug!("Could not set crypt algorithms (server-client): {}", err);
         }
     }
     if let Some(algos) = params.mac.as_deref() {
         if let Err(err) = session.method_pref(MethodType::MacCs, algos.join(",").as_str()) {
-            panic!("Could not set MAC algorithms (client-server): {}", err);
+            debug!("Could not set MAC algorithms (client-server): {}", err);
         }
         if let Err(err) = session.method_pref(MethodType::MacSc, algos.join(",").as_str()) {
-            panic!("Could not set MAC algorithms (server-client): {}", err);
+            debug!("Could not set MAC algorithms (server-client): {}", err);
         }
     }
+    */
 }
